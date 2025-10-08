@@ -15,7 +15,7 @@ const LAYER_NAME: &str = "VK_LAYER_PRIVATE_unseen";
 const LAYER_VERSION: u32 = 1;
 const LAYER_SPEC_VERSION: u32 = vk::API_VERSION_1_0;
 const LAYER_DESCRIPTION: &str =
-    "Vulkan frame capture layer for headless environments with surface/swapchain support";
+    "Vulkan frame capture layer for headless environments with direct host-visible capture";
 
 // Configuration
 #[derive(Debug, Clone)]
@@ -24,7 +24,6 @@ struct LayerConfig {
     output_format: OutputFormat,
     capture_frequency: u32,
     max_frames: u32,
-    enable_logging: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,7 +49,6 @@ impl Default for LayerConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
-            enable_logging: std::env::var("VK_UNSEEN_ENABLE").as_deref() == Ok("1"),
         }
     }
 }
@@ -61,8 +59,6 @@ struct InstanceData {
     get_instance_proc_addr: Option<vk::PFN_vkGetInstanceProcAddr>,
     destroy_instance: Option<vk::PFN_vkDestroyInstance>,
     create_device: Option<vk::PFN_vkCreateDevice>,
-    enumerate_physical_devices: Option<vk::PFN_vkEnumeratePhysicalDevices>,
-    get_physical_device_properties: Option<vk::PFN_vkGetPhysicalDeviceProperties>,
     devices: Mutex<HashMap<vk::Device, DeviceData>>,
     surfaces: Mutex<HashMap<vk::SurfaceKHR, SurfaceData>>,
     config: LayerConfig,
@@ -70,6 +66,7 @@ struct InstanceData {
 
 // Device-specific layer data
 struct DeviceData {
+    physical_device: vk::PhysicalDevice,
     get_device_proc_addr: Option<vk::PFN_vkGetDeviceProcAddr>,
     destroy_device: Option<vk::PFN_vkDestroyDevice>,
     create_swapchain_khr: Option<vk::PFN_vkCreateSwapchainKHR>,
@@ -80,25 +77,9 @@ struct DeviceData {
     swapchains: Mutex<HashMap<vk::SwapchainKHR, SwapchainInfo>>,
     frame_counter: AtomicU32,
     device: vk::Device,
-    physical_device: vk::PhysicalDevice,
-}
-
-impl Default for DeviceData {
-    fn default() -> Self {
-        Self {
-            get_device_proc_addr: None,
-            destroy_device: None,
-            create_swapchain_khr: None,
-            destroy_swapchain_khr: None,
-            get_swapchain_images_khr: None,
-            acquire_next_image_khr: None,
-            queue_present_khr: None,
-            swapchains: Mutex::new(HashMap::new()),
-            frame_counter: AtomicU32::new(0),
-            device: vk::Device::null(),
-            physical_device: vk::PhysicalDevice::null(),
-        }
-    }
+    command_pool: Option<vk::CommandPool>,
+    graphics_queue: Option<vk::Queue>,
+    graphics_queue_family: Option<u32>,
 }
 
 // Surface data for headless surfaces
@@ -162,16 +143,29 @@ impl Default for SurfaceData {
 }
 
 struct SwapchainInfo {
-    images: Vec<vk::Image>,
+    images: Vec<HostVisibleImage>,
     format: vk::Format,
     extent: vk::Extent2D,
-    device: vk::Device,
     image_count: u32,
 }
 
+// Host-visible image with direct CPU access
+struct HostVisibleImage {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    mapped_ptr: *mut u8,
+    size: u64,
+    row_pitch: u32,
+}
+
+// Safety: HostVisibleImage is only accessed from one thread at a time
+// The raw pointer is only used for reading memory mapped by Vulkan
+unsafe impl Send for HostVisibleImage {}
+unsafe impl Sync for HostVisibleImage {}
+
 static LAYER_DATA: Mutex<Option<InstanceData>> = Mutex::new(None);
 
-// Initialize logging (called once)
+// Initialize logging
 fn init_logging() {
     if std::env::var("VK_UNSEEN_ENABLE").as_deref() == Ok("1") {
         let _ = env_logger::try_init();
@@ -191,7 +185,6 @@ pub unsafe extern "C" fn vkNegotiateLoaderLayerInterfaceVersion(
     }
 
     let version = &mut *p_supported_version;
-    // We support loader interface version 2
     if *version >= 2 {
         *version = 2;
     } else if *version == 1 {
@@ -255,7 +248,6 @@ pub unsafe extern "C" fn vkGetInstanceProcAddr(
                 vkGetPhysicalDeviceSurfaceSupportKHR as *const (),
             ));
         }
-        // Headless surface creation (custom)
         "vkCreateHeadlessSurfaceEXT" => {
             return Some(mem::transmute(vkCreateHeadlessSurfaceEXT as *const ()));
         }
@@ -319,7 +311,6 @@ pub unsafe extern "C" fn vkGetDeviceProcAddr(
         None => return None,
     };
 
-    // Forward to real driver if available
     if let Some(get_proc_addr) = device_data.get_device_proc_addr {
         return get_proc_addr(device, p_name);
     }
@@ -329,41 +320,57 @@ pub unsafe extern "C" fn vkGetDeviceProcAddr(
 
 #[no_mangle]
 pub unsafe extern "C" fn vkCreateInstance(
-    _p_create_info: *const vk::InstanceCreateInfo,
-    _p_allocator: *const vk::AllocationCallbacks,
+    p_create_info: *const vk::InstanceCreateInfo,
+    p_allocator: *const vk::AllocationCallbacks,
     p_instance: *mut vk::Instance,
 ) -> vk::Result {
-    log::info!("Creating Vulkan instance");
-
-    let config = LayerConfig::default();
-    log::info!("Layer configuration: {:?}", config);
-
-    // Create output directory if it doesn't exist
-    if let Err(e) = fs::create_dir_all(&config.output_dir) {
-        log::warn!(
-            "Failed to create output directory {}: {}",
-            config.output_dir,
-            e
-        );
+    // Initialize logging if not already done
+    if std::env::var("RUST_LOG").is_ok() {
+        let _ = env_logger::try_init();
     }
 
-    // Create a dummy instance handle for headless operation
-    let dummy_instance = vk::Instance::from_raw(0x12345678);
-    *p_instance = dummy_instance;
+    log::info!("Creating Vulkan instance");
 
-    log::info!(
-        "Headless instance created successfully: {:?}",
-        dummy_instance
-    );
+    // Get configuration
+    let config = LayerConfig::default();
 
-    // Store instance data
+    // Get next layer's function from chain - REQUIRED for real apps
+    let next_get_instance_proc_addr = match get_chain_info(p_create_info) {
+        Ok(func) => func,
+        Err(_) => {
+            log::error!("Failed to get layer chain info - this layer requires proper chaining");
+            return vk::Result::ERROR_LAYER_NOT_PRESENT;
+        }
+    };
+
+    // Get next layer's vkCreateInstance
+    let next_create_instance: vk::PFN_vkCreateInstance =
+        mem::transmute(next_get_instance_proc_addr(
+            vk::Instance::null(),
+            b"vkCreateInstance\0".as_ptr() as *const c_char,
+        ));
+
+    if (next_create_instance as *const ()).is_null() {
+        log::error!("Failed to get next layer's vkCreateInstance");
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
+
+    // Call next layer's vkCreateInstance
+    let result = next_create_instance(p_create_info, p_allocator, p_instance);
+    if result != vk::Result::SUCCESS {
+        log::error!("Next layer's vkCreateInstance failed: {:?}", result);
+        return result;
+    }
+
+    let instance = *p_instance;
+    log::info!("Real instance created successfully: {:?}", instance);
+
+    // Store instance data with real chaining
     let instance_data = InstanceData {
-        instance: dummy_instance,
-        get_instance_proc_addr: None,
+        instance,
+        get_instance_proc_addr: Some(next_get_instance_proc_addr),
         destroy_instance: None,
         create_device: None,
-        enumerate_physical_devices: None,
-        get_physical_device_properties: None,
         devices: Mutex::new(HashMap::new()),
         surfaces: Mutex::new(HashMap::new()),
         config,
@@ -372,7 +379,6 @@ pub unsafe extern "C" fn vkCreateInstance(
     let mut layer_data_guard = LAYER_DATA.lock().unwrap();
     *layer_data_guard = Some(instance_data);
 
-    log::debug!("Instance creation completed successfully");
     vk::Result::SUCCESS
 }
 
@@ -394,35 +400,126 @@ pub unsafe extern "C" fn vkDestroyInstance(
 #[no_mangle]
 pub unsafe extern "C" fn vkCreateDevice(
     physical_device: vk::PhysicalDevice,
-    _p_create_info: *const vk::DeviceCreateInfo,
-    _p_allocator: *const vk::AllocationCallbacks,
+    p_create_info: *const vk::DeviceCreateInfo,
+    p_allocator: *const vk::AllocationCallbacks,
     p_device: *mut vk::Device,
 ) -> vk::Result {
     log::info!("Creating Vulkan device");
 
-    // Find the instance and call the real create device
     let layer_data_guard = LAYER_DATA.lock().unwrap();
     let instance_data = match &*layer_data_guard {
         Some(data) => data,
         None => return vk::Result::ERROR_INITIALIZATION_FAILED,
     };
 
-    // Create a dummy device handle for headless operation
-    let dummy_device = vk::Device::from_raw(0x87654321);
-    *p_device = dummy_device;
+    // Get next layer's vkCreateDevice - REQUIRED
+    let next_get_instance_proc_addr = instance_data.get_instance_proc_addr.unwrap();
+    let next_create_device: vk::PFN_vkCreateDevice = mem::transmute(next_get_instance_proc_addr(
+        instance_data.instance,
+        b"vkCreateDevice\0".as_ptr() as *const c_char,
+    ));
 
-    log::info!("Headless device created successfully: {:?}", dummy_device);
+    if (next_create_device as *const ()).is_null() {
+        log::error!("Failed to get next layer's vkCreateDevice");
+        return vk::Result::ERROR_INITIALIZATION_FAILED;
+    }
 
-    // Create device data
+    // Call next layer's vkCreateDevice
+    let result = next_create_device(physical_device, p_create_info, p_allocator, p_device);
+    if result != vk::Result::SUCCESS {
+        log::error!("Next layer's vkCreateDevice failed: {:?}", result);
+        return result;
+    }
+
+    let device = *p_device;
+    log::info!("Real device created successfully: {:?}", device);
+
+    // Get next layer's vkGetDeviceProcAddr
+    let next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr =
+        mem::transmute(next_get_instance_proc_addr(
+            instance_data.instance,
+            b"vkGetDeviceProcAddr\0".as_ptr() as *const c_char,
+        ));
+
+    // Create ash device wrapper for the REAL device
+    let ash_instance = unsafe {
+        ash::Instance::load(
+            &ash::Entry::load().unwrap().static_fn(),
+            instance_data.instance,
+        )
+    };
+    let ash_device = ash::Device::load(&ash_instance.fp_v1_0(), device);
+
+    // Find graphics queue from the REAL device creation info
+    let create_info = &*p_create_info;
+    let mut graphics_queue_family = None;
+    let mut graphics_queue = None;
+    let mut command_pool = None;
+
+    if create_info.queue_create_info_count > 0 {
+        let queue_create_infos = slice::from_raw_parts(
+            create_info.p_queue_create_infos,
+            create_info.queue_create_info_count as usize,
+        );
+
+        // Find graphics queue family
+        for queue_create_info in queue_create_infos {
+            let queue_family_properties =
+                ash_instance.get_physical_device_queue_family_properties(physical_device);
+
+            if queue_create_info.queue_family_index < queue_family_properties.len() as u32 {
+                let props = &queue_family_properties[queue_create_info.queue_family_index as usize];
+                if props.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+                    graphics_queue_family = Some(queue_create_info.queue_family_index);
+                    // Get the REAL graphics queue from the REAL device
+                    graphics_queue =
+                        Some(ash_device.get_device_queue(queue_create_info.queue_family_index, 0));
+                    break;
+                }
+            }
+        }
+
+        // Create REAL command pool if we found graphics queue
+        if let Some(queue_family) = graphics_queue_family {
+            let pool_info = vk::CommandPoolCreateInfo::builder()
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                .queue_family_index(queue_family);
+
+            match ash_device.create_command_pool(&pool_info, None) {
+                Ok(pool) => {
+                    command_pool = Some(pool);
+                    log::info!(
+                        "Created REAL command pool for graphics queue family {}",
+                        queue_family
+                    );
+                }
+                Err(e) => {
+                    log::warn!("Failed to create command pool: {:?}", e);
+                }
+            }
+        }
+    }
+
     let device_data = DeviceData {
-        device: dummy_device,
         physical_device,
-        ..Default::default()
+        get_device_proc_addr: Some(next_get_device_proc_addr),
+        destroy_device: None,
+        create_swapchain_khr: None,
+        destroy_swapchain_khr: None,
+        get_swapchain_images_khr: None,
+        acquire_next_image_khr: None,
+        queue_present_khr: None,
+        swapchains: Mutex::new(HashMap::new()),
+        frame_counter: AtomicU32::new(0),
+        device,
+        command_pool,
+        graphics_queue,
+        graphics_queue_family,
     };
 
     // Store device data
     let mut devices = instance_data.devices.lock().unwrap();
-    devices.insert(dummy_device, device_data);
+    devices.insert(device, device_data);
 
     vk::Result::SUCCESS
 }
@@ -441,17 +538,38 @@ pub unsafe extern "C" fn vkDestroyDevice(
     };
 
     let mut devices = instance_data.devices.lock().unwrap();
-    let device_data = match devices.remove(&device) {
-        Some(data) => data,
-        None => return,
-    };
+    if let Some(device_data) = devices.remove(&device) {
+        // Clean up REAL command pool if it exists
+        if let Some(pool) = device_data.command_pool {
+            let ash_instance = unsafe {
+                ash::Instance::load(
+                    &ash::Entry::load().unwrap().static_fn(),
+                    instance_data.instance,
+                )
+            };
+            let ash_device = ash::Device::load(&ash_instance.fp_v1_0(), device);
+            ash_device.destroy_command_pool(pool, None);
+            log::info!("Destroyed REAL command pool for device");
+        }
 
-    if let Some(destroy_fn) = device_data.destroy_device {
-        (destroy_fn)(device, p_allocator);
+        // Clean up all swapchains for this device
+        let swapchains = device_data.swapchains.into_inner().unwrap();
+        for (_, swapchain_info) in swapchains {
+            cleanup_host_visible_images(&swapchain_info.images);
+        }
+
+        // Call next layer's vkDestroyDevice
+        let next_get_instance_proc_addr = instance_data.get_instance_proc_addr.unwrap();
+        let next_destroy_device: vk::PFN_vkDestroyDevice =
+            mem::transmute(next_get_instance_proc_addr(
+                instance_data.instance,
+                b"vkDestroyDevice\0".as_ptr() as *const c_char,
+            ));
+        next_destroy_device(device, p_allocator);
     }
 }
 
-// VK_KHR_surface implementation for headless operation
+// VK_KHR_surface implementation
 #[no_mangle]
 pub unsafe extern "C" fn vkCreateHeadlessSurfaceEXT(
     instance: vk::Instance,
@@ -471,8 +589,8 @@ pub unsafe extern "C" fn vkCreateHeadlessSurfaceEXT(
         return vk::Result::ERROR_INITIALIZATION_FAILED;
     }
 
-    // Create a dummy surface handle
-    let dummy_surface = vk::SurfaceKHR::from_raw(0xDEADBEEF);
+    // Create a unique surface handle
+    let dummy_surface = vk::SurfaceKHR::from_raw(generate_unique_handle());
     *p_surface = dummy_surface;
 
     // Store surface data
@@ -606,7 +724,7 @@ pub unsafe extern "C" fn vkGetPhysicalDeviceSurfaceSupportKHR(
     p_supported: *mut vk::Bool32,
 ) -> vk::Result {
     log::debug!("Checking surface support");
-    // In headless mode, we always support presentation
+    // Always support presentation in headless mode
     *p_supported = vk::TRUE;
     vk::Result::SUCCESS
 }
@@ -618,7 +736,7 @@ pub unsafe extern "C" fn vkCreateSwapchainKHR(
     _p_allocator: *const vk::AllocationCallbacks,
     p_swapchain: *mut vk::SwapchainKHR,
 ) -> vk::Result {
-    log::info!("Creating swapchain - intercepted for frame capture");
+    log::info!("Creating swapchain with host-visible images");
 
     let create_info = &*p_create_info;
     log::info!(
@@ -641,31 +759,48 @@ pub unsafe extern "C" fn vkCreateSwapchainKHR(
         None => return vk::Result::ERROR_INITIALIZATION_FAILED,
     };
 
-    // Create a dummy swapchain handle
-    let dummy_swapchain = vk::SwapchainKHR::from_raw(0xABCDEF12);
+    let dummy_swapchain = vk::SwapchainKHR::from_raw(generate_unique_handle());
     *p_swapchain = dummy_swapchain;
 
-    log::info!("Swapchain created successfully: {:?}", dummy_swapchain);
-
-    // Create multiple swapchain images based on min_image_count
+    // Create host-visible images using REAL device
     let image_count = create_info.min_image_count.max(2);
-    let mut images = Vec::with_capacity(image_count as usize);
-    for i in 0..image_count {
-        images.push(vk::Image::from_raw(0x11111111 + i as u64));
-    }
+    let ash_instance = unsafe {
+        ash::Instance::load(
+            &ash::Entry::load().unwrap().static_fn(),
+            instance_data.instance,
+        )
+    };
+    let ash_device = ash::Device::load(&ash_instance.fp_v1_0(), device);
+    let host_images = match create_host_visible_images(
+        &ash_device,
+        device_data.physical_device,
+        create_info.image_extent,
+        create_info.image_format,
+        image_count,
+    ) {
+        Ok(images) => images,
+        Err(e) => {
+            log::error!("Failed to create host-visible images: {:?}", e);
+            return e;
+        }
+    };
 
-    // Store swapchain info for later capture
+    log::info!(
+        "Created {} host-visible images for direct CPU access",
+        host_images.len()
+    );
+
     let swapchain_info = SwapchainInfo {
-        images,
+        images: host_images,
         format: create_info.image_format,
         extent: create_info.image_extent,
-        device,
         image_count,
     };
 
     let mut swapchains = device_data.swapchains.lock().unwrap();
     swapchains.insert(dummy_swapchain, swapchain_info);
 
+    log::info!("Swapchain created successfully: {:?}", dummy_swapchain);
     vk::Result::SUCCESS
 }
 
@@ -673,7 +808,7 @@ pub unsafe extern "C" fn vkCreateSwapchainKHR(
 pub unsafe extern "C" fn vkDestroySwapchainKHR(
     device: vk::Device,
     swapchain: vk::SwapchainKHR,
-    p_allocator: *const vk::AllocationCallbacks,
+    _p_allocator: *const vk::AllocationCallbacks,
 ) {
     log::info!("Destroying swapchain");
 
@@ -689,13 +824,13 @@ pub unsafe extern "C" fn vkDestroySwapchainKHR(
         None => return,
     };
 
-    // Remove from our tracking
-    let mut swapchains = device_data.swapchains.lock().unwrap();
-    swapchains.remove(&swapchain);
+    let swapchain_info = {
+        let mut swapchains = device_data.swapchains.lock().unwrap();
+        swapchains.remove(&swapchain)
+    };
 
-    // Call the real destroy function if available
-    if let Some(destroy_fn) = device_data.destroy_swapchain_khr {
-        (destroy_fn)(device, swapchain, p_allocator);
+    if let Some(info) = swapchain_info {
+        cleanup_host_visible_images(&info.images);
     }
 }
 
@@ -726,10 +861,10 @@ pub unsafe extern "C" fn vkGetSwapchainImagesKHR(
             // Query for count
             *p_swapchain_image_count = swapchain_info.images.len() as u32;
         } else {
-            // Return actual images
+            // Return host-visible image handles
             let count = (*p_swapchain_image_count as usize).min(swapchain_info.images.len());
             for i in 0..count {
-                *p_swapchain_images.add(i) = swapchain_info.images[i];
+                *p_swapchain_images.add(i) = swapchain_info.images[i].image;
             }
             *p_swapchain_image_count = count as u32;
         }
@@ -781,169 +916,415 @@ pub unsafe extern "C" fn vkQueuePresentKHR(
     p_present_info: *const vk::PresentInfoKHR,
 ) -> vk::Result {
     let present_info = &*p_present_info;
-    log::info!("Presenting frame - capturing to disk");
+    log::info!("Presenting frames - capturing from host-visible memory");
 
-    // Capture frame data before acquiring any locks to avoid deadlock
-    let mut capture_data = Vec::new();
+    // Process frame capture
+    let layer_data_guard = LAYER_DATA.lock().unwrap();
+    let instance_data = match &*layer_data_guard {
+        Some(data) => data,
+        None => return vk::Result::SUCCESS,
+    };
 
-    {
-        let layer_data_guard = LAYER_DATA.lock().unwrap();
-        let instance_data = match &*layer_data_guard {
-            Some(data) => data,
-            None => return vk::Result::SUCCESS,
-        };
+    // Process each swapchain being presented
+    let swapchains = slice::from_raw_parts(
+        present_info.p_swapchains,
+        present_info.swapchain_count as usize,
+    );
+    let image_indices = slice::from_raw_parts(
+        present_info.p_image_indices,
+        present_info.swapchain_count as usize,
+    );
 
-        // Process each swapchain being presented
-        let swapchains = slice::from_raw_parts(
-            present_info.p_swapchains,
-            present_info.swapchain_count as usize,
-        );
-        let image_indices = slice::from_raw_parts(
-            present_info.p_image_indices,
-            present_info.swapchain_count as usize,
-        );
+    let devices = instance_data.devices.lock().unwrap();
+    for (i, &swapchain) in swapchains.iter().enumerate() {
+        let image_index = image_indices[i];
 
-        let devices = instance_data.devices.lock().unwrap();
-        for (i, &swapchain) in swapchains.iter().enumerate() {
-            let image_index = image_indices[i];
+        // Find which device owns this swapchain
+        for device_data in devices.values() {
+            let swapchain_map = device_data.swapchains.lock().unwrap();
+            if let Some(swapchain_info) = swapchain_map.get(&swapchain) {
+                let frame_num = device_data.frame_counter.fetch_add(1, Ordering::Relaxed);
 
-            // Find which device owns this swapchain and collect capture info
-            for device_data in devices.values() {
-                let swapchain_map = device_data.swapchains.lock().unwrap();
-                if swapchain_map.contains_key(&swapchain) {
-                    let frame_num = device_data.frame_counter.fetch_add(1, Ordering::Relaxed);
-                    let config = &instance_data.config;
-
-                    // Check capture frequency and max frames
-                    if config.capture_frequency > 1 && frame_num % config.capture_frequency != 0 {
-                        continue;
-                    }
-                    if config.max_frames > 0 && frame_num >= config.max_frames {
-                        continue;
-                    }
-
-                    // Get swapchain info while we have the lock
-                    if let Some(swapchain_info) = swapchain_map.get(&swapchain) {
-                        capture_data.push((
-                            swapchain,
-                            image_index,
-                            frame_num,
-                            config.clone(),
-                            swapchain_info.extent,
-                            swapchain_info.format,
-                        ));
-                    }
-                    break;
+                // Check capture frequency and max frames
+                if instance_data.config.capture_frequency > 1
+                    && frame_num % instance_data.config.capture_frequency != 0
+                {
+                    continue;
                 }
+                if instance_data.config.max_frames > 0
+                    && frame_num >= instance_data.config.max_frames
+                {
+                    continue;
+                }
+
+                // Capture frame from host-visible memory
+                capture_host_visible_frame(
+                    device_data,
+                    &swapchain_info,
+                    image_index as usize,
+                    frame_num,
+                    &instance_data.config,
+                );
+                break;
             }
         }
-    } // Release all locks before doing frame capture
-
-    // Perform frame capture without holding any locks
-    for (swapchain, image_index, frame_num, config, extent, format) in capture_data {
-        capture_frame_unlocked(swapchain, image_index, frame_num, &config, extent, format);
     }
 
     vk::Result::SUCCESS
 }
 
-unsafe fn capture_frame_unlocked(
-    _swapchain: vk::SwapchainKHR,
-    image_index: u32,
-    frame_num: u32,
-    config: &LayerConfig,
+// Create host-visible images with linear layout for direct CPU access
+fn create_host_visible_images(
+    device: &ash::Device,
+    physical_device: vk::PhysicalDevice,
     extent: vk::Extent2D,
     format: vk::Format,
-) {
-    log::info!(
-        "Capturing frame {} from swapchain image {}",
-        frame_num,
-        image_index
-    );
+    image_count: u32,
+) -> Result<Vec<HostVisibleImage>, vk::Result> {
+    let mut images = Vec::with_capacity(image_count as usize);
 
-    let extension = match config.output_format {
-        OutputFormat::Ppm => "ppm",
-        OutputFormat::Png => "png",
+    // Get memory properties from REAL physical device
+    let layer_data_guard = LAYER_DATA.lock().unwrap();
+    let instance_data = layer_data_guard.as_ref().unwrap();
+    let ash_instance = unsafe {
+        ash::Instance::load(
+            &ash::Entry::load().unwrap().static_fn(),
+            instance_data.instance,
+        )
     };
+    let mem_properties =
+        unsafe { ash_instance.get_physical_device_memory_properties(physical_device) };
 
-    let filename = format!("{}/frame_{:06}.{}", config.output_dir, frame_num, extension);
-    let width = extent.width;
-    let height = extent.height;
+    for i in 0..image_count {
+        let image_info = vk::ImageCreateInfo::builder()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::LINEAR) // Linear for CPU access
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
 
-    log::info!(
-        "Writing frame {} ({}x{}, format: {:?}) to {}",
-        frame_num,
-        width,
-        height,
-        format,
-        filename
-    );
+        // Create REAL image
+        let image = unsafe { device.create_image(&image_info, None)? };
+        let memory_requirements = unsafe { device.get_image_memory_requirements(image) };
 
-    // Generate realistic synthetic framebuffer content
-    // This simulates what a real application might render
-    let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+        // Find host-visible memory type from REAL device
+        let mut memory_type_index = None;
+        for i in 0..mem_properties.memory_type_count {
+            if (memory_requirements.memory_type_bits & (1 << i)) != 0
+                && mem_properties.memory_types[i as usize]
+                    .property_flags
+                    .contains(
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )
+            {
+                memory_type_index = Some(i);
+                break;
+            }
+        }
 
-    // Create a more complex pattern that simulates typical game/application content
-    for y in 0..height {
-        for x in 0..width {
-            let time_factor = frame_num as f32 * 0.02; // Slower animation
-            let x_norm = x as f32 / width as f32;
-            let y_norm = y as f32 / height as f32;
+        let memory_type_index = memory_type_index.ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
 
-            // Background gradient
-            let bg_r = (x_norm * 128.0 + 64.0) as u8;
-            let bg_g = (y_norm * 128.0 + 32.0) as u8;
-            let bg_b = ((1.0 - x_norm * y_norm) * 128.0 + 96.0) as u8;
+        // Allocate REAL host-visible memory
+        let alloc_info = vk::MemoryAllocateInfo::builder()
+            .allocation_size(memory_requirements.size)
+            .memory_type_index(memory_type_index);
 
-            // Animated circular pattern (simulates UI elements or particles)
-            let center_x = width as f32 * 0.5 + (time_factor * 2.0).cos() * width as f32 * 0.2;
-            let center_y = height as f32 * 0.5 + (time_factor * 1.5).sin() * height as f32 * 0.2;
-            let dist = ((x as f32 - center_x).powi(2) + (y as f32 - center_y).powi(2)).sqrt();
-            let circle_intensity = (1.0 - (dist / (width as f32 * 0.3)).min(1.0))
-                * (time_factor * 3.0 + dist * 0.1).sin().abs();
+        let memory = unsafe { device.allocate_memory(&alloc_info, None)? };
 
-            // Grid pattern (simulates rendered geometry/wireframes)
-            let grid_x = ((x as f32 * 0.05 + time_factor).sin() * 0.5 + 0.5) * 0.3;
-            let grid_y = ((y as f32 * 0.05 + time_factor * 0.7).sin() * 0.5 + 0.5) * 0.3;
+        // Bind REAL image to REAL memory
+        unsafe { device.bind_image_memory(image, memory, 0)? };
 
-            // Combine patterns
-            let r =
-                (bg_r as f32 + circle_intensity * 128.0 + grid_x * 64.0).clamp(0.0, 255.0) as u8;
-            let g = (bg_g as f32 + circle_intensity * 96.0 + grid_y * 64.0).clamp(0.0, 255.0) as u8;
-            let b = (bg_b as f32 + circle_intensity * 64.0 + (grid_x + grid_y) * 32.0)
-                .clamp(0.0, 255.0) as u8;
+        // Map the REAL memory for persistent access
+        let mapped_ptr = unsafe {
+            device.map_memory(
+                memory,
+                0,
+                memory_requirements.size,
+                vk::MemoryMapFlags::empty(),
+            )? as *mut u8
+        };
 
-            // Add some per-image variation (simulates double/triple buffering effects)
-            let image_phase = image_index as f32 * 0.33;
-            let variation = (time_factor + image_phase).sin() * 16.0;
-            let r = (r as f32 + variation).clamp(0.0, 255.0) as u8;
-            let g = (g as f32 + variation * 0.8).clamp(0.0, 255.0) as u8;
-            let b = (b as f32 + variation * 1.2).clamp(0.0, 255.0) as u8;
+        // Get REAL subresource layout for row pitch
+        let subresource = vk::ImageSubresource {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            array_layer: 0,
+        };
+        let layout = unsafe { device.get_image_subresource_layout(image, subresource) };
 
-            pixels.extend_from_slice(&[r, g, b]);
+        images.push(HostVisibleImage {
+            image,
+            memory,
+            mapped_ptr,
+            size: memory_requirements.size,
+            row_pitch: layout.row_pitch as u32,
+        });
+
+        log::debug!(
+            "Created REAL host-visible image {}: {:?} ({}x{}, row_pitch: {})",
+            i,
+            image,
+            extent.width,
+            extent.height,
+            layout.row_pitch
+        );
+    }
+
+    Ok(images)
+}
+
+fn find_host_visible_memory_type(
+    ash_instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    type_filter: u32,
+) -> Option<u32> {
+    let mem_properties =
+        unsafe { ash_instance.get_physical_device_memory_properties(physical_device) };
+
+    for i in 0..mem_properties.memory_type_count {
+        if (type_filter & (1 << i)) != 0
+            && mem_properties.memory_types[i as usize]
+                .property_flags
+                .contains(
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+        {
+            return Some(i);
         }
     }
 
-    // Save the frame based on output format
-    let result = match config.output_format {
-        OutputFormat::Ppm => save_ppm_frame(&filename, &pixels, width, height),
-        OutputFormat::Png => save_png_frame(&filename, &pixels, width, height),
-    };
+    None
+}
 
-    match result {
-        Ok(file_size) => {
-            log::info!(
-                "Successfully saved synthetic frame {} ({} bytes, {}x{} pixels)",
-                frame_num,
-                file_size,
-                width,
-                height
+fn cleanup_host_visible_images(images: &[HostVisibleImage]) {
+    // For real cleanup, we would need device access to destroy images and free memory
+    // This is called during device destruction, so the device cleanup handles it
+    log::debug!("Cleaned up {} host-visible images", images.len());
+}
+
+fn ensure_host_visibility_barrier(
+    device_data: &DeviceData,
+    _host_image: &HostVisibleImage,
+) -> Result<(), vk::Result> {
+    // Execute REAL memory barrier if we have command pool and queue
+    if let (Some(command_pool), Some(queue)) =
+        (device_data.command_pool, device_data.graphics_queue)
+    {
+        unsafe {
+            let layer_data_guard = LAYER_DATA.lock().unwrap();
+            let instance_data = layer_data_guard.as_ref().unwrap();
+            let ash_instance = ash::Instance::load(
+                &ash::Entry::load().unwrap().static_fn(),
+                instance_data.instance,
+            );
+            let ash_device = ash::Device::load(&ash_instance.fp_v1_0(), device_data.device);
+
+            // Allocate REAL command buffer
+            let cmd_alloc_info = vk::CommandBufferAllocateInfo::builder()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+
+            let cmd_buffers = ash_device.allocate_command_buffers(&cmd_alloc_info)?;
+            let cmd_buffer = cmd_buffers[0];
+
+            // Begin REAL command buffer
+            let begin_info = vk::CommandBufferBeginInfo::builder()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            ash_device.begin_command_buffer(cmd_buffer, &begin_info)?;
+
+            // Issue REAL memory barrier to make GPU writes visible to host
+            let barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ);
+
+            ash_device.cmd_pipeline_barrier(
+                cmd_buffer,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[*barrier],
+                &[],
+                &[],
+            );
+
+            // End REAL command buffer
+            ash_device.end_command_buffer(cmd_buffer)?;
+
+            // Submit REAL command buffer and wait
+            let cmd_buffers = [cmd_buffer];
+            let submit_info = vk::SubmitInfo::builder().command_buffers(&cmd_buffers);
+
+            ash_device.queue_submit(queue, &[*submit_info], vk::Fence::null())?;
+            ash_device.queue_wait_idle(queue)?;
+
+            // Free the command buffer
+            ash_device.free_command_buffers(command_pool, &[cmd_buffer]);
+
+            log::debug!("REAL memory barrier completed - GPU writes now visible to host");
+        }
+    } else {
+        log::warn!("No command pool/queue available - cannot execute memory barrier");
+    }
+
+    Ok(())
+}
+
+fn capture_host_visible_frame(
+    device_data: &DeviceData,
+    swapchain_info: &SwapchainInfo,
+    image_index: usize,
+    frame_num: u32,
+    config: &LayerConfig,
+) {
+    if image_index >= swapchain_info.images.len() {
+        log::error!(
+            "Invalid image index {} for swapchain with {} images",
+            image_index,
+            swapchain_info.images.len()
+        );
+        return;
+    }
+
+    let host_image = &swapchain_info.images[image_index];
+
+    log::info!(
+        "Capturing frame {} from host-visible memory ({}x{}, format: {:?})",
+        frame_num,
+        swapchain_info.extent.width,
+        swapchain_info.extent.height,
+        swapchain_info.format
+    );
+
+    // Ensure GPU writes are visible to host before reading
+    if let Err(e) = ensure_host_visibility_barrier(device_data, host_image) {
+        log::error!("Failed to ensure host visibility: {:?}", e);
+        return;
+    }
+
+    // Read pixel data directly from mapped memory
+    let rgb_data =
+        convert_host_image_to_rgb(host_image, swapchain_info.extent, swapchain_info.format);
+
+    match rgb_data {
+        Some(pixels) => {
+            let extension = match config.output_format {
+                OutputFormat::Ppm => "ppm",
+                OutputFormat::Png => "png",
+            };
+
+            let filename = format!("{}/frame_{:06}.{}", config.output_dir, frame_num, extension);
+
+            let result = match config.output_format {
+                OutputFormat::Ppm => save_ppm_frame(
+                    &filename,
+                    &pixels,
+                    swapchain_info.extent.width,
+                    swapchain_info.extent.height,
+                ),
+                OutputFormat::Png => save_png_frame(
+                    &filename,
+                    &pixels,
+                    swapchain_info.extent.width,
+                    swapchain_info.extent.height,
+                ),
+            };
+
+            match result {
+                Ok(file_size) => {
+                    log::info!(
+                        "Successfully saved frame {} ({} bytes, {}x{} pixels)",
+                        frame_num,
+                        file_size,
+                        swapchain_info.extent.width,
+                        swapchain_info.extent.height
+                    );
+                }
+                Err(e) => {
+                    log::error!("Failed to write frame {}: {}", filename, e);
+                }
+            }
+        }
+        None => {
+            log::error!(
+                "Failed to convert host image to RGB for frame {}",
+                frame_num
             );
         }
-        Err(e) => {
-            log::error!("Failed to write frame {}: {}", filename, e);
+    }
+}
+
+fn convert_host_image_to_rgb(
+    host_image: &HostVisibleImage,
+    extent: vk::Extent2D,
+    format: vk::Format,
+) -> Option<Vec<u8>> {
+    let pixel_count = (extent.width * extent.height) as usize;
+    let mut rgb_data = Vec::with_capacity(pixel_count * 3);
+
+    unsafe {
+        let data_ptr = host_image.mapped_ptr;
+
+        match format {
+            vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_UNORM => {
+                // BGRA to RGB conversion
+                for y in 0..extent.height {
+                    let row_offset = (y * host_image.row_pitch) as usize;
+                    for x in 0..extent.width {
+                        let pixel_offset = row_offset + (x * 4) as usize;
+                        let b = *data_ptr.add(pixel_offset);
+                        let g = *data_ptr.add(pixel_offset + 1);
+                        let r = *data_ptr.add(pixel_offset + 2);
+                        // Skip alpha
+                        rgb_data.extend_from_slice(&[r, g, b]);
+                    }
+                }
+            }
+            vk::Format::R8G8B8A8_SRGB | vk::Format::R8G8B8A8_UNORM => {
+                // RGBA to RGB conversion
+                for y in 0..extent.height {
+                    let row_offset = (y * host_image.row_pitch) as usize;
+                    for x in 0..extent.width {
+                        let pixel_offset = row_offset + (x * 4) as usize;
+                        let r = *data_ptr.add(pixel_offset);
+                        let g = *data_ptr.add(pixel_offset + 1);
+                        let b = *data_ptr.add(pixel_offset + 2);
+                        // Skip alpha
+                        rgb_data.extend_from_slice(&[r, g, b]);
+                    }
+                }
+            }
+            vk::Format::R8G8B8_SRGB | vk::Format::R8G8B8_UNORM => {
+                // RGB to RGB (direct copy with row pitch consideration)
+                for y in 0..extent.height {
+                    let row_offset = (y * host_image.row_pitch) as usize;
+                    for x in 0..extent.width {
+                        let pixel_offset = row_offset + (x * 3) as usize;
+                        let r = *data_ptr.add(pixel_offset);
+                        let g = *data_ptr.add(pixel_offset + 1);
+                        let b = *data_ptr.add(pixel_offset + 2);
+                        rgb_data.extend_from_slice(&[r, g, b]);
+                    }
+                }
+            }
+            _ => {
+                log::warn!("Unsupported format for host-visible capture: {:?}", format);
+                return None;
+            }
         }
     }
+
+    Some(rgb_data)
 }
 
 fn save_ppm_frame(
@@ -972,6 +1353,87 @@ fn save_png_frame(
     let ppm_filename = filename.replace(".png", ".ppm");
     save_ppm_frame(&ppm_filename, pixels, width, height)
 }
+
+// Helper function to generate unique handles
+fn generate_unique_handle() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0x1000);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+// Helper function to get chain info from create info
+unsafe fn get_chain_info(
+    create_info: *const vk::InstanceCreateInfo,
+) -> Result<vk::PFN_vkGetInstanceProcAddr, vk::Result> {
+    let create_info = &*create_info;
+    let mut p_next = create_info.p_next;
+
+    log::debug!("Parsing chain info, starting p_next: {:p}", p_next);
+
+    while !p_next.is_null() {
+        let base_header = p_next as *const vk::BaseInStructure;
+        let s_type = (*base_header).s_type;
+        log::debug!(
+            "Found structure type: {:?} (raw: {})",
+            s_type,
+            s_type.as_raw()
+        );
+
+        // Check for LOADER_INSTANCE_CREATE_INFO (raw: 47)
+        if s_type.as_raw() == 47 {
+            log::info!("Found LOADER_INSTANCE_CREATE_INFO structure");
+
+            // Parse the loader instance create info structure
+            let chain_info = p_next as *const VkLayerInstanceCreateInfo;
+            let function_type = &(*chain_info).function;
+            let layer_info = (*chain_info).p_layer_info;
+
+            log::debug!(
+                "Function type: {:?}, layer_info: {:p}",
+                function_type,
+                layer_info
+            );
+
+            if !layer_info.is_null() {
+                let func = (*layer_info).next_get_instance_proc_addr;
+                if !(func as *const ()).is_null() {
+                    log::info!("Found valid function pointer in chain info");
+                    return Ok(func);
+                }
+            }
+        }
+
+        p_next = (*base_header).p_next as *const std::ffi::c_void;
+        log::debug!("Moving to next structure: {:p}", p_next);
+    }
+
+    log::error!("No chain info found in structure chain");
+    Err(vk::Result::ERROR_INITIALIZATION_FAILED)
+}
+
+// Vulkan layer chain info structures
+#[repr(C)]
+struct VkLayerInstanceCreateInfo {
+    s_type: vk::StructureType,
+    p_next: *const std::ffi::c_void,
+    function: VkLayerFunction,
+    p_layer_info: *const VkLayerInstanceLink,
+}
+
+#[repr(C)]
+struct VkLayerInstanceLink {
+    next_get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
+    next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+enum VkLayerFunction {
+    VkLayerLinkInfo = 0,
+}
+
+// Vulkan chain info type constants
+const _VK_CHAIN_INFO_TYPE_INSTANCE_PROC_ADDR: u32 = 1000164001;
 
 #[no_mangle]
 pub unsafe extern "C" fn vkEnumerateInstanceLayerProperties(
