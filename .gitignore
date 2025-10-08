@@ -1,0 +1,32 @@
+# Rust build outputs
+/target/
+
+# C program build outputs (legacy - now in target/)
+/*_test
+*.exe
+
+# Test/demo outputs
+/captured_frames/
+**/captured_frames/
+
+# Shared libraries (legacy - now in target/)
+/*.so
+*.dll
+*.dylib
+
+# Temporary demo directories
+/tmp/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log

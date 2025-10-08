@@ -1,0 +1,28 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_PRIVATE_unseen",
+    "type": "GLOBAL",
+    "library_path": "./libVkLayer_PRIVATE_unseen.so",
+    "api_version": "1.0.0",
+    "implementation_version": "1",
+    "description": "Vulkan frame capture layer for headless environments",
+    "functions": {
+      "vkGetInstanceProcAddr": "vkGetInstanceProcAddr",
+      "vkGetDeviceProcAddr": "vkGetDeviceProcAddr"
+    },
+    "instance_extensions": [],
+    "device_extensions": [
+      {
+        "name": "VK_KHR_swapchain",
+        "spec_version": "1"
+      }
+    ],
+    "enable_environment": {
+      "VK_UNSEEN_ENABLE": "1"
+    },
+    "disable_environment": {
+      "VK_UNSEEN_DISABLE": "1"
+    }
+  }
+}
